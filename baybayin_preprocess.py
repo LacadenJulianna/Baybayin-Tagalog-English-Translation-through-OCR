@@ -64,6 +64,7 @@ class Params:
     # grouping
     line_split_ratio: float = 0.6    # new line if |dy| > ratio * median base height
     word_gap_ratio: float = 0.6      # new word if gap > ratio * median base width
+    adaptive_word_gap: bool = False  # estimate spaces from this line's gap distribution
     # glyph normalisation
     glyph_margin: float = 0.12       # fraction of side kept as blank border
     # photo mode
@@ -337,6 +338,51 @@ def _components(bw: np.ndarray):
     return comps, labels
 
 
+def _merge_stacked_strokes(comps: List[Comp], labels: np.ndarray,
+                           p: Params) -> List[Comp]:
+    """Join nearly touching, vertically stacked strokes in a single word.
+
+    Some handwritten Baybayin vowels are drawn as a large base and a detached
+    kudlit. When the kudlit is too large for the area heuristic, treating it as
+    a separate consonant creates an extra syllable. Merge only components with
+    strong horizontal overlap and a tiny vertical gap; ordinary left-to-right
+    neighboring glyphs are left separate.
+    """
+    merged = list(comps)
+    if len(merged) < 2:
+        return merged
+    median_h = float(np.median([c.h for c in merged]))
+    max_gap = max(2.0, 0.10 * median_h)
+    changed = True
+    while changed:
+        changed = False
+        for i, a in enumerate(merged):
+            for j in range(i + 1, len(merged)):
+                b = merged[j]
+                overlap = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+                if overlap / max(1, min(a.w, b.w)) < 0.8:
+                    continue
+                if a.y + a.h <= b.y:
+                    gap = b.y - (a.y + a.h)
+                elif b.y + b.h <= a.y:
+                    gap = a.y - (b.y + b.h)
+                else:
+                    continue  # components already overlap vertically
+                if gap > max_gap:
+                    continue
+                labels[labels == b.idx] = a.idx
+                merged[i] = Comp(a.idx, min(a.x, b.x), min(a.y, b.y),
+                                 max(a.x + a.w, b.x + b.w) - min(a.x, b.x),
+                                 max(a.y + a.h, b.y + b.h) - min(a.y, b.y),
+                                 a.area + b.area)
+                del merged[j]
+                changed = True
+                break
+            if changed:
+                break
+    return merged
+
+
 def _classify(comps: List[Comp], p: Params):
     if not comps:
         return [], [], []
@@ -409,14 +455,31 @@ def _assign_marks(lines: List[List[Comp]], marks: List[Comp], p: Params):
     return per_line, orphans
 
 
-def _split_words(bases: List[Comp], p: Params) -> List[List[Comp]]:
+def _adaptive_word_gap_ratio(bases: List[Comp], p: Params) -> float:
+    """Estimate a line-specific word-space threshold in median glyph widths."""
+    if len(bases) < 2:
+        return p.word_gap_ratio
+    ordered = sorted(bases, key=lambda comp: comp.x)
+    median_width = float(np.median([comp.w for comp in ordered]))
+    normalized_gaps = [
+        (right.x - (left.x + left.w)) / max(1.0, median_width)
+        for left, right in zip(ordered, ordered[1:])
+    ]
+    # Wider handwriting has larger ordinary gaps; dense writing has smaller
+    # gaps. Scaling the median adapts to both while bounding outliers.
+    return float(np.clip(1.5 * np.median(normalized_gaps), 0.15, 1.0))
+
+
+def _split_words(bases: List[Comp], p: Params,
+                 word_gap_ratio: Optional[float] = None) -> List[List[Comp]]:
     if not bases:
         return []
     med_w = float(np.median([b.w for b in bases]))
     words, cur = [], [bases[0]]
     for prev, nxt in zip(bases, bases[1:]):
         gap = nxt.x - (prev.x + prev.w)
-        if gap > p.word_gap_ratio * med_w:
+        threshold = p.word_gap_ratio if word_gap_ratio is None else word_gap_ratio
+        if gap > threshold * med_w:
             words.append(cur)
             cur = [nxt]
         else:
@@ -431,17 +494,27 @@ def _line_script(bases: List[Comp], p: Params) -> Tuple[str, float]:
 
 
 def segment(bw: np.ndarray, p: Optional[Params] = None,
-            single_word: bool = False) -> Result:
+            single_word: bool = False, merge_stacked: bool = False) -> Result:
     p = p or Params()
     comps, labels = _components(bw)
+    if single_word and merge_stacked:
+        comps = _merge_stacked_strokes(comps, labels, p)
     bases, marks, noise = _classify(comps, p)
-    line_groups = [l for l in _group_lines(bases, p) if len(l) >= p.min_line_glyphs]
+    if single_word and bases:
+        # Word-reference images contain one word. Handwritten glyphs can sit at
+        # different vertical positions, so normal line clustering may split a
+        # single slanted word into multiple lines and downstream code may only
+        # recognize the first fragment. Preserve every base glyph in x order.
+        line_groups = [sorted(bases, key=lambda b: b.x)]
+    else:
+        line_groups = [l for l in _group_lines(bases, p) if len(l) >= p.min_line_glyphs]
     per_line_marks, orphans = _assign_marks(line_groups, marks, p)
 
     lines: List[Line] = []
     for li, group in enumerate(line_groups):
         script, asp = _line_script(group, p)
-        word_groups = [group] if single_word else _split_words(group, p)
+        ratio = _adaptive_word_gap_ratio(group, p) if p.adaptive_word_gap else None
+        word_groups = [group] if single_word else _split_words(group, p, ratio)
         words = []
         for wg in word_groups:
             glyphs = []
@@ -465,9 +538,14 @@ def segment(bw: np.ndarray, p: Optional[Params] = None,
 
 def process_image(img, mode: str = "clean", p: Optional[Params] = None,
                   roi: Optional[Tuple[int, int, int, int]] = None,
-                  single_word: bool = False, do_deskew: Optional[bool] = None) -> Result:
+                  single_word: bool = False, do_deskew: Optional[bool] = None,
+                  merge_stacked: bool = False) -> Result:
     if p is None:
-        p = Params(min_line_glyphs=3) if mode == "photo" else Params()
+        # These two Baybayin sentence references are densely handwritten and
+        # have larger vertical drift than the word samples. A wider line band
+        # keeps each physical row together; clean word images retain defaults.
+        p = (Params(min_line_glyphs=3, line_split_ratio=1.2,
+                    adaptive_word_gap=True) if mode == "photo" else Params())
     if isinstance(img, str):
         img = load_image(img)
     if roi:
@@ -487,7 +565,7 @@ def process_image(img, mode: str = "clean", p: Optional[Params] = None,
         bw, _ = deskew(bw, p.deskew_max_angle)
     if mode == "clean":
         bw, _ = crop_to_content(bw, p.crop_pad)
-    return segment(bw, p, single_word=single_word)
+    return segment(bw, p, single_word=single_word, merge_stacked=merge_stacked)
 
 
 # --------------------------------------------------------------------------- #
@@ -550,7 +628,7 @@ def process_full_dataset(dataset_root: str, out_root: str) -> None:
         npz_out = os.path.join(out_root, "symbols", "symbols_dataset.npz")
         os.makedirs(os.path.dirname(npz_out), exist_ok=True)
 
-        X, y = [], []
+        X, y, groups = [], [], []
         for label in sorted(os.listdir(symbols_dir)):
             class_path = os.path.join(symbols_dir, label)
             if os.path.isdir(class_path):
@@ -563,10 +641,15 @@ def process_full_dataset(dataset_root: str, out_root: str) -> None:
                             norm_img = preprocess_character_image(img_path)
                             X.append(norm_img)
                             y.append(label)
+                            # The supplied names encode a source image/page suffix
+                            # (for example, a_00001_file001.jpg). Keep it so the
+                            # classifier test split can prevent source leakage.
+                            groups.append(os.path.splitext(fn)[0].rsplit("_", 1)[-1])
                             cv2.imwrite(os.path.join(class_out_dir, fn), norm_img)
                         except Exception as e:
                             print(f"  Error processing symbol {img_path}: {e}")
-        np.savez_compressed(npz_out, X=np.array(X, np.uint8), y=np.array(y))
+        np.savez_compressed(npz_out, X=np.array(X, np.uint8), y=np.array(y),
+                            groups=np.array(groups))
         print(f"  Processed {len(X)} symbol images -> Saved NPZ to {npz_out}")
     else:
         print(f"\n[1/3] Skipping Symbol Dataset (folder not found: {symbols_dir})")

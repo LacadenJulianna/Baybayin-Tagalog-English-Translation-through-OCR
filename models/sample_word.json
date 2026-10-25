@@ -1,0 +1,67 @@
+{
+  "image": "dataset/Baybayin Word Images/1 Gwapo.PNG",
+  "lines": [
+    {
+      "stage2_candidates": [
+        [
+          {
+            "word": "gwapo",
+            "visual": -1.683674270205018,
+            "unverified": false,
+            "n_coda": 0
+          },
+          {
+            "word": "guwapo",
+            "visual": -2.6229545203038716,
+            "unverified": false,
+            "n_coda": 0
+          },
+          {
+            "word": "guwapa",
+            "visual": -5.250035658872415,
+            "unverified": false,
+            "n_coda": 0
+          }
+        ]
+      ],
+      "stage3_ranked": [
+        {
+          "score": -5.311,
+          "words": [
+            "gwapo"
+          ],
+          "unverified": [
+            false
+          ]
+        },
+        {
+          "score": -5.759,
+          "words": [
+            "guwapo"
+          ],
+          "unverified": [
+            false
+          ]
+        },
+        {
+          "score": -9.736,
+          "words": [
+            "guwapa"
+          ],
+          "unverified": [
+            false
+          ]
+        }
+      ],
+      "tagalog": "gwapo",
+      "unverified_words": [],
+      "stage4_english": {
+        "english": "handsome",
+        "method": "dictionary"
+      },
+      "seconds": 0.001,
+      "baybayin_reading": "gwapo",
+      "segmentation": "standard"
+    }
+  ]
+}

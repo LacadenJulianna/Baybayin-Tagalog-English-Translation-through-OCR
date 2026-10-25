@@ -34,6 +34,7 @@ torch (CNN), transformers (NLLB).
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -67,7 +68,7 @@ CODAS = ["n", "ng", "s", "t", "g", "m", "l", "k", "d", "p", "b", "r", "h", "w", 
 @dataclass
 class TParams:
     alpha: float = 1.0          # weight of the visual score
-    beta: float = 1.0           # weight of the language-model score
+    beta: float = 0.25          # down-weight LM scores relative to glyph evidence
     lam: float = 0.7            # bigram / unigram interpolation
     k: float = 0.1              # add-k smoothing for unigrams
     coda_penalty: float = 2.0   # log-penalty per omitted coda consonant
@@ -101,7 +102,8 @@ class Lexicon:
             self.by_len[len(w)].append(w)
 
     @classmethod
-    def from_data_dir(cls, data_dir: str) -> "Lexicon":
+    def from_data_dir(cls, data_dir: str,
+                      extra_words: Iterable[str] = ()) -> "Lexicon":
         import pandas as pd
         p = os.path.join(data_dir, "Tagalog Dictionary", "tagalog words.csv")
         # NOTE: this file has NO header row; the first word would be lost otherwise.
@@ -110,6 +112,10 @@ class Lexicon:
         q = os.path.join(data_dir, "Tagalog Dictionary", "diksyo_tagalog_vocabulary.csv")
         if os.path.exists(q):
             words |= set(pd.read_csv(q, usecols=["word"])["word"].dropna().astype(str))
+        # Training-side word-image labels supply inflected forms missing from
+        # the dictionary vocabulary. Held-out references must be excluded by
+        # the calling evaluation command.
+        words |= {str(word) for word in extra_words}
         return cls(words)
 
 
@@ -187,8 +193,11 @@ def build_lm(data_dir: str, lex: Lexicon, p: TParams, cache: Optional[str] = Non
     import pandas as pd
     if cache and os.path.exists(cache):
         lm = BigramLM.load(cache)
-        lm.k, lm.lam = p.k, p.lam
-        return lm
+        if lm.vocab == lex.words:
+            lm.k, lm.lam = p.k, p.lam
+            return lm
+        # Cached n-gram counts map out-of-vocabulary candidates to <unk>; a
+        # lexicon change therefore requires rebuilding counts over the corpus.
     lm = BigramLM(lex.words, p.k, p.lam)
     cpath = os.path.join(data_dir, "Tagalog English Dictionary Dataset", "Tagalog to English.csv")
     if os.path.exists(cpath):
@@ -225,8 +234,8 @@ def _lse(a: float, b: float) -> float:
 
 def syllable_options(g: GlyphObs) -> List[Tuple[str, float]]:
     """All Latin readings of one glyph with log-probabilities.
-    Vowel ambiguity (e/i, o/u) and d/r are NOT split: every reading gets the full
-    probability, so the language model decides between them."""
+    Probability mass is divided across equivalent readings (e/i, o/u, d/r) so
+    expanding one classifier class into alternatives does not inflate its score."""
     opts: Dict[str, float] = {}
 
     def add(s: str, lp: float) -> None:
@@ -234,13 +243,23 @@ def syllable_options(g: GlyphObs) -> List[Tuple[str, float]]:
 
     for cls, clp in g.class_logp.items():
         if cls in VOWEL_CLASS:
-            for v in VOWEL_CLASS[cls]:
-                add(v, clp)
+            # One classifier class can represent several Latin readings. Split its
+            # probability mass across those readings so ambiguity does not create
+            # probability from nowhere (notably e/i and o/u).
+            readings = VOWEL_CLASS[cls]
+            lp = clp - math.log(len(readings))
+            for v in readings:
+                add(v, lp)
         elif cls in CLASS_CONSONANT:
+            readings = CLASS_CONSONANT[cls]
+            consonant_lp = clp - math.log(len(readings))
             for mark, mlp in g.mark_logp.items():
-                for cons in CLASS_CONSONANT[cls]:
+                for cons in readings:
                     for v in MARK_VOWELS[mark]:
-                        add(cons + v, clp + mlp)
+                        # A kudlit class also represents two vowels; divide its
+                        # conditional mass between them for calibrated ranking.
+                        vowels = MARK_VOWELS[mark]
+                        add(cons + v, consonant_lp + mlp - math.log(len(vowels)))
     return sorted(opts.items(), key=lambda t: -t[1])
 
 
@@ -404,13 +423,28 @@ class EnglishTranslator:
             df = pd.read_csv(p2).dropna()
             for w, d in zip(df["tagalog_word"].astype(str).str.lower(),
                             df["english_definition"].astype(str)):
-                gloss = re.sub(r"^\S+\s+(?:n|v|adj|adv|prep|conj|pron|interj|part)\.?\s+", "", d)
+                gloss = re.sub(
+                    r"^\S+\s+(?:(?:n|v|adj|adv|prep|conj|pron|interj|part)\.?,?\s*)+",
+                    "", d, flags=re.IGNORECASE)
                 self.dict.setdefault(w, gloss.strip())
         p1 = os.path.join(data_dir, "Tagalog Dictionary", "diksyo_tagalog_vocabulary.csv")
         if os.path.exists(p1):               # preferred source (short English glosses)
             df = pd.read_csv(p1, usecols=["word", "translation"]).dropna()
+            preferred = defaultdict(list)
             for w, t in zip(df["word"].astype(str).str.lower(), df["translation"].astype(str)):
-                self.dict[w] = t
+                # Repeated entries are often different parts of speech. Keep all
+                # unique senses so noun "laban" does not lose "fight" to its
+                # later preposition sense "against".
+                if t not in preferred[w]:
+                    preferred[w].append(t)
+            self.dict.update({w: "; ".join(senses) for w, senses in preferred.items()})
+        # Filipino orthography commonly writes /gwa/ as either "gwa" or
+        # "guwa". Keep both keys available to the same dictionary gloss.
+        for word, gloss in list(self.dict.items()):
+            if "guw" in word:
+                self.dict.setdefault(word.replace("guw", "gw"), gloss)
+            if "gw" in word:
+                self.dict.setdefault(word.replace("gw", "guw"), gloss)
         self.use_nllb, self.nllb_name = use_nllb, nllb_name
         self._tok = self._model = None
 
@@ -493,6 +527,9 @@ class BaybayinTranslator:
                 continue
             words_obs = []
             for w in line.words:
+                if not w.glyphs:
+                    words_obs.append([])
+                    continue
                 imgs = np.stack([g.image for g in w.glyphs])
                 probs = self.clf.predict_proba(imgs)
                 words_obs.append([obs_from_probs(probs[i], self.clf.classes, g.marks,
@@ -502,13 +539,121 @@ class BaybayinTranslator:
         return lines
 
     def translate_image(self, path: str, mode: str = "clean",
-                        single_word: bool = False, roi=None) -> Dict:
+                        single_word: bool = False, roi=None,
+                        merge_stacked: bool = False) -> Dict:
         from baybayin_preprocess import process_image
-        res = process_image(path, mode=mode, single_word=single_word, roi=roi)
-        out_lines = []
-        for words_obs in self.observations_from_result(res):
-            out_lines.append(self.translate_observations(words_obs))
+        variants = [merge_stacked]
+        options, out_lines = [], []
+        for merge_stacked in variants:
+            res = process_image(path, mode=mode, single_word=single_word, roi=roi,
+                                merge_stacked=merge_stacked)
+            # Photo-mode sentence references in this corpus contain Baybayin
+            # only; the aspect-ratio heuristic was dropping wide handwritten
+            # rows as if they were Latin text.
+            for words_obs in self.observations_from_result(
+                    res, baybayin_only=(not single_word and mode != "photo")):
+                row = self.translate_observations(words_obs)
+                raw_words = [greedy_reading(word_obs)[0] for word_obs in words_obs if word_obs]
+                row["baybayin_reading"] = " ".join(raw_words)
+                row["segmentation"] = "stacked-stroke merge" if merge_stacked else "standard"
+                ranked = row.get("stage3_ranked") or [{}]
+                score = ranked[0].get("score", -float("inf"))
+                glyph_count = sum(len(word_obs) for word_obs in words_obs)
+                if single_word:
+                    options.append(((not bool(row.get("unverified_words")),
+                                     score / max(1, glyph_count)), row))
+                else:
+                    out_lines.append(row)
+        if single_word and options:
+            out_lines = [options[0][1]]
         return {"image": path, "lines": out_lines}
+
+
+def print_translation_report(result: Dict, tagalog_reference_image: Optional[str] = None) -> None:
+    """Print compact, human-readable OCR/Tagalog/English results for the terminal."""
+    print(f"Baybayin image: {result['image']}")
+    if tagalog_reference_image:
+        print(f"Tagalog guide image: {tagalog_reference_image}")
+    for i, line in enumerate(result.get("lines", []), 1):
+        english = line.get("stage4_english", {})
+        print(f"\nLine {i}")
+        print("  Baybayin reading (approx.): " + (line.get("baybayin_reading") or "[no glyphs detected]"))
+        print("  Tagalog model output:       " + (line.get("tagalog") or "[no words recognized]"))
+        if line.get("segmentation"):
+            print("  Segmentation:               " + line["segmentation"])
+        if english:
+            print("  English translation:        " + english.get("english", ""))
+            print("  Translation method:         " + english.get("method", "unknown"))
+        if line.get("unverified_words"):
+            print("  Unverified words:           " + ", ".join(line["unverified_words"]))
+        print(f"  Processing time:            {line.get('seconds', 0):.3f} s")
+
+
+def evaluate_sentence_pairs(tr: BaybayinTranslator, image_dir: str,
+                             out_json: Optional[str] = None,
+                             references_csv: Optional[str] = None) -> List[Dict]:
+    """Run Baybayin-side images that have a same-number .1 Tagalog reference image."""
+    references = {}
+    if references_csv and os.path.isfile(references_csv):
+        with open(references_csv, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                references[os.path.basename(row.get("image", "")).lower()] = row
+    pairs = []
+    for fn in sorted(os.listdir(image_dir)):
+        stem, ext = os.path.splitext(fn)
+        if not ext.lower() in (".png", ".jpg", ".jpeg", ".bmp") or stem.endswith(".1"):
+            continue
+        guide = os.path.join(image_dir, stem + ".1" + ext)
+        if not os.path.isfile(guide):
+            continue
+        source = os.path.join(image_dir, fn)
+        result = tr.translate_image(source, mode="photo")
+        ref = references.get(fn.lower(), {})
+        predicted_tl = " ".join(line.get("tagalog", "") for line in result["lines"])
+        predicted_en = " ".join(line.get("stage4_english", {}).get("english", "")
+                                 for line in result["lines"])
+        tagalog_ref = ref.get("tagalog_reference", "").strip()
+        english_ref = ref.get("english_reference", "").strip()
+        pair = {"baybayin_image": source, "tagalog_reference_image": guide,
+                "reference_text_transcribed": bool(tagalog_ref),
+                "tagalog_reference": tagalog_ref or None,
+                "english_reference": english_ref or None,
+                "tagalog_cer": cer(tagalog_ref.lower(), predicted_tl.lower()) if tagalog_ref else None,
+                "tagalog_wer": wer(tagalog_ref.lower(), predicted_tl.lower()) if tagalog_ref else None,
+                "english_cer": cer(english_ref.lower(), predicted_en.lower()) if english_ref else None,
+                "english_wer": wer(english_ref.lower(), predicted_en.lower()) if english_ref else None,
+                "result": result}
+        pairs.append(pair)
+        print("\n" + "=" * 72)
+        print_translation_report(result, guide)
+        if tagalog_ref:
+            print("  Tagalog reference text:      " + tagalog_ref)
+            print(f"  Tagalog CER / WER:           {pair['tagalog_cer']:.3f} / {pair['tagalog_wer']:.3f}")
+        if english_ref:
+            print("  English reference text:      " + english_ref)
+            print(f"  English CER / WER:           {pair['english_cer']:.3f} / {pair['english_wer']:.3f}")
+    if not pairs:
+        print("No numbered Baybayin/Tagalog image pairs found (expected x.jpg and x.1.jpg).")
+    else:
+        unscored_tl = sum(not pair["tagalog_reference"] for pair in pairs)
+        unscored_en = sum(not pair["english_reference"] for pair in pairs)
+        scored_tl = [pair for pair in pairs if pair["tagalog_reference"]]
+        if scored_tl:
+            mean_cer = float(np.mean([pair["tagalog_cer"] for pair in scored_tl]))
+            mean_wer = float(np.mean([pair["tagalog_wer"] for pair in scored_tl]))
+            print(f"\nSentence Tagalog reference scores: {len(scored_tl)} pairs; "
+                  f"mean CER={mean_cer:.3f}; mean WER={mean_wer:.3f}.")
+        if unscored_tl:
+            print(f"Unscored Tagalog guide pairs: {unscored_tl}. Check their text in "
+                  "sentence_pair_references.csv.")
+        if unscored_en:
+            print(f"Unscored English translation pairs: {unscored_en}; no checked English "
+                  "references are available in sentence_pair_references.csv.")
+    if out_json:
+        os.makedirs(os.path.dirname(out_json) or ".", exist_ok=True)
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(pairs, f, indent=2, ensure_ascii=False)
+    return pairs
 
 
 # --------------------------------------------------------------------------- #
@@ -529,7 +674,9 @@ def cer(ref: str, hyp: str) -> float:
 
 
 def wer(ref: str, hyp: str) -> float:
-    r, h = ref.split(), hyp.split()
+    # Ignore punctuation and case so the score reflects word recognition rather
+    # than apostrophe/period formatting differences in handwritten references.
+    r, h = tokenize(ref), tokenize(hyp)
     return edit_distance(r, h) / max(1, len(r))
 
 
@@ -598,6 +745,8 @@ def selftest(data_dir: str, n: int, p: TParams, lm_cache: Optional[str], seed: i
             break
     tr = BaybayinTranslator(lex, lm, p)
     top1 = top5 = recall = 0
+    beta_sweep = (0.0, 0.1, 0.25, 0.5, 1.0)
+    beta_top1 = Counter()
     ncand = []
     misses = []
     t0 = time.time()
@@ -611,6 +760,13 @@ def selftest(data_dir: str, n: int, p: TParams, lm_cache: Optional[str], seed: i
         allr = sorted(((p.alpha * c.visual + p.beta * lm.logp(lm.key(c.word), None), c.word)
                        for c in cands), reverse=True)
         order = [x[1] for x in allr]
+        for beta in beta_sweep:
+            beta_order = sorted(
+                cands,
+                key=lambda c: p.alpha * c.visual + beta * lm.logp(lm.key(c.word), None),
+                reverse=True,
+            )
+            beta_top1[beta] += bool(beta_order) and beta_order[0].word == w
         recall += w in order
         top1 += bool(order) and order[0] == w
         top5 += w in order[:5]
@@ -619,7 +775,12 @@ def selftest(data_dir: str, n: int, p: TParams, lm_cache: Optional[str], seed: i
     N = len(tests)
     res = {"words_tested": N, "candidate_recall": recall / N, "top1": top1 / N,
            "top5": top5 / N, "mean_candidates": float(np.mean(ncand)),
-           "median_candidates": float(np.median(ncand)), "seconds": round(time.time() - t0, 1)}
+           "median_candidates": float(np.median(ncand)),
+           "top1_by_beta_diagnostic": {str(b): beta_top1[b] / N for b in beta_sweep},
+           "seconds": round(time.time() - t0, 1),
+           "lexicon_words": len(lex.words), "prefixes": len(lex.prefixes),
+           "lm_tokens": lm.total, "bigrams": len(lm.bi),
+           "sample_misses": [{"reference": w, "predicted": o} for w, o in misses]}
     print(json.dumps(res, indent=2))
     print("sample misses (true word -> top-3 predicted):")
     for w, o in misses:
@@ -631,41 +792,99 @@ def selftest(data_dir: str, n: int, p: TParams, lm_cache: Optional[str], seed: i
 # Word-image evaluation
 # --------------------------------------------------------------------------- #
 def evaluate_word_images(tr: BaybayinTranslator, img_dir: str, limit: int = 0,
-                         seed: int = 0, out_json: Optional[str] = None) -> Dict:
+                         seed: int = 0, out_json: Optional[str] = None,
+                         include_english: bool = False,
+                         file_list: Optional[Sequence[str]] = None) -> Dict:
     from baybayin_preprocess import process_image
-    files = sorted(f for f in os.listdir(img_dir) if f.lower().endswith((".png", ".jpg", ".jpeg")))
-    random.Random(seed).shuffle(files)
+    valid_ext = (".png", ".jpg", ".jpeg", ".bmp")
+    if file_list is None:
+        files = sorted(f for f in os.listdir(img_dir) if f.lower().endswith(valid_ext))
+        random.Random(seed).shuffle(files)
+    else:
+        files = [os.path.basename(f) for f in file_list
+                 if f.lower().endswith(valid_ext) and os.path.isfile(os.path.join(img_dir, os.path.basename(f)))]
     if limit:
         files = files[:limit]
     rows, ex1, ex5, cers = [], 0, 0, []
+    variant_counts = {False: [0, 0, 0, []], True: [0, 0, 0, []]}
+    beta_sweep = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0)
+    beta_top1 = Counter()
     for fn in files:
         ref = label_from_filename(fn)
         try:
-            res = process_image(os.path.join(img_dir, fn), mode="clean", single_word=True)
-            lines = tr.observations_from_result(res)
-            if not lines or not lines[0]:
-                raise ValueError("no glyphs found")
-            words_obs = lines[0]
-            wobs = [g for w in words_obs for g in w]      # single word: merge groups
-            cands = search_word(wobs, tr.lex, tr.p)
-            allr = sorted(((tr.p.alpha * c.visual + tr.p.beta *
-                            tr.lm.logp(tr.lm.key(c.word), None), c) for c in cands),
-                          key=lambda t: -t[0], reverse=True)
-            order = [c.word for _, c in allr]
+            variants = []
+            for merge_stacked in (False, True):
+                res = process_image(os.path.join(img_dir, fn), mode="clean",
+                                    single_word=True, merge_stacked=merge_stacked)
+                # These word-reference images may be handwritten at an angle;
+                # preserve all base glyphs and let lexical evidence choose the
+                # standard or stacked-stroke segmentation hypothesis.
+                lines = tr.observations_from_result(res, baybayin_only=False)
+                if not lines or not lines[0]:
+                    continue
+                wobs = [g for word in lines[0] for g in word]
+                cands = search_word(wobs, tr.lex, tr.p)
+                allr = sorted(((tr.p.alpha * c.visual + tr.p.beta *
+                                tr.lm.logp(tr.lm.key(c.word), None), c) for c in cands),
+                              key=lambda item: item[0], reverse=True)
+                if allr:
+                    chosen = allr[0][1]
+                    variant_order = [c.word for _, c in allr]
+                    stats = variant_counts[merge_stacked]
+                    stats[0] += 1
+                    stats[1] += variant_order[0] == ref
+                    stats[2] += ref in variant_order[:5]
+                    stats[3].append(cer(ref, variant_order[0]))
+                    variants.append((not chosen.unverified,
+                                     allr[0][0] / max(1, len(wobs)), merge_stacked,
+                                     cands, allr, variant_order))
+            if not variants:
+                raise ValueError("no glyphs or word candidates found")
+            # Standard segmentation is the measured default; the stacked-stroke
+            # path is retained as a diagnostic hypothesis but lost accuracy on
+            # the independent grouped test split.
+            standard = next((v for v in variants if not v[2]), variants[0])
+            _verified, _score, used_merge, cands, allr, order = standard
+            for beta in beta_sweep:
+                beta_order = sorted(cands,
+                    key=lambda c: tr.p.alpha * c.visual + beta *
+                    tr.lm.logp(tr.lm.key(c.word), None), reverse=True)
+                beta_top1[beta] += bool(beta_order) and beta_order[0].word == ref
         except Exception as e:
             order = []
-            rows.append({"file": fn, "ref": ref, "error": str(e)})
+            rows.append({"file": fn, "ref": ref, "top5": [], "error": str(e)})
             cers.append(1.0)
             continue
         hyp = order[0] if order else ""
         ex1 += hyp == ref
         ex5 += ref in order[:5]
         cers.append(cer(ref, hyp))
-        rows.append({"file": fn, "ref": ref, "top5": order[:5],
-                     "unverified": bool(cands and cands[0].unverified)})
+        row = {"file": fn, "ref": ref, "top5": order[:5],
+               "unverified": bool(allr and allr[0][1].unverified),
+               "segmentation": "stacked-stroke merge" if used_merge else "standard"}
+        if include_english and hyp and tr.translator:
+            english = tr.translator.translate([hyp])
+            row["english"] = english["english"]
+            row["translation_method"] = english["method"]
+        rows.append(row)
+        if include_english:
+            gloss = row.get("english", "[no translation]")
+            method = row.get("translation_method", "")
+            print(f"{fn} | reference: {ref} | Tagalog: {hyp or '[none]'} | "
+                  f"English: {gloss} | method: {method}")
     N = len(files)
-    summary = {"images": N, "exact_match_top1": ex1 / N, "top5_word_identification": ex5 / N,
-               "mean_cer_vs_filename": float(np.mean(cers))}
+    failures = sum("error" in row for row in rows)
+    summary = {"images": N, "failed_images": failures,
+               "exact_match_top1": ex1 / max(1, N), "top5_word_identification": ex5 / max(1, N),
+               "mean_cer_vs_filename": float(np.mean(cers)) if cers else 0.0,
+               "top1_by_beta_diagnostic": {str(b): beta_top1[b] / max(1, N)
+                                           for b in beta_sweep}}
+    summary["segmentation_hypotheses"] = {
+        ("stacked_stroke_merge" if merge else "standard"): {
+            "images": values[0], "top1": values[1] / max(1, values[0]),
+            "top5": values[2] / max(1, values[0]),
+            "mean_cer": float(np.mean(values[3])) if values[3] else 0.0}
+        for merge, values in variant_counts.items()}
     print(json.dumps(summary, indent=2))
     if out_json:
         with open(out_json, "w") as f:
@@ -676,9 +895,13 @@ def evaluate_word_images(tr: BaybayinTranslator, img_dir: str, limit: int = 0,
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def _build(args) -> BaybayinTranslator:
-    p = TParams()
-    lex = Lexicon.from_data_dir(args.data)
+def _build(args, extra_words: Optional[Iterable[str]] = None) -> BaybayinTranslator:
+    p = TParams(alpha=args.alpha, beta=args.beta)
+    if extra_words is None:
+        word_dir = os.path.join(args.data, "Baybayin Word Images")
+        extra_words = {label_from_filename(fn) for fn in os.listdir(word_dir)
+                       if fn.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))}
+    lex = Lexicon.from_data_dir(args.data, extra_words=extra_words)
     lm = build_lm(args.data, lex, p, cache=args.lm_cache)
     tr_en = EnglishTranslator(args.data, use_nllb=not args.no_nllb)
     clf = CNNClassifier(args.cnn)
@@ -693,15 +916,30 @@ def main() -> None:
     def common(s):
         s.add_argument("--data", default="dataset")
         s.add_argument("--lm-cache", default="models/lm.pkl")
+        s.add_argument("--alpha", type=float, default=1.0,
+                       help="weight for visual/glyph evidence (default: 1.0)")
+        s.add_argument("--beta", type=float, default=0.25,
+                       help="weight for the language model (default: 0.25)")
 
     s = sub.add_parser("selftest")
     common(s)
     s.add_argument("--n", type=int, default=2000)
+    s.add_argument("--seed", type=int, default=0,
+                   help="seed for repeatable oracle word sampling")
+    s.add_argument("--out", default="models/selftest.json")
 
     s = sub.add_parser("words")
     common(s)
     s.add_argument("--cnn", default="models/cnn.pt")
     s.add_argument("--limit", type=int, default=0)
+    s.add_argument("--seed", type=int, default=0,
+                   help="seed for repeatable word-image sampling")
+    s.add_argument("--file-list", default=None,
+                   help="evaluate exactly these image filenames, one per line")
+    s.add_argument("--lexicon-exclude-file-list", default=None,
+                   help="exclude these reference labels from filename-derived lexicon words")
+    s.add_argument("--english", action="store_true",
+                   help="translate each top-1 Tagalog word and print each result")
     s.add_argument("--no-nllb", action="store_true")
     s.add_argument("--out", default="models/word_eval.json")
 
@@ -711,22 +949,74 @@ def main() -> None:
     s.add_argument("--cnn", default="models/cnn.pt")
     s.add_argument("--mode", choices=["clean", "photo"], default="clean")
     s.add_argument("--word", action="store_true", help="treat the image as a single word")
+    s.add_argument("--merge-stacked", action="store_true",
+                   help="diagnostic: merge close stacked strokes (can hurt overall accuracy)")
     s.add_argument("--no-nllb", action="store_true")
+    s.add_argument("--pretty", action="store_true", help="print a compact translation report")
+    s.add_argument("--out", default=None, help="also save the JSON result")
+
+    s = sub.add_parser("pairs")
+    common(s)
+    s.add_argument("--cnn", default="models/cnn.pt")
+    s.add_argument("--no-nllb", action="store_true")
+    s.add_argument("--out", default="models/sentence_pair_results.json")
+    s.add_argument("--references", default=None,
+                   help="CSV with image,tagalog_reference,english_reference for scoring")
 
     args = ap.parse_args()
     if args.cmd in ("selftest",):
         os.makedirs(os.path.dirname(args.lm_cache) or ".", exist_ok=True)
-        selftest(args.data, args.n, TParams(), args.lm_cache)
+        result = selftest(args.data, args.n, TParams(alpha=args.alpha, beta=args.beta),
+                          args.lm_cache, seed=args.seed)
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
     elif args.cmd == "words":
         os.makedirs(os.path.dirname(args.lm_cache) or ".", exist_ok=True)
-        tr = _build(args)
+        files = None
+        if args.file_list:
+            # PowerShell Set-Content -Encoding utf8 may include a UTF-8 BOM;
+            # strip it so the first requested filename is not silently skipped.
+            with open(args.file_list, encoding="utf-8-sig") as f:
+                files = [line.strip() for line in f if line.strip()]
+        else:
+            image_dir = os.path.join(args.data, "Baybayin Word Images")
+            files = sorted(f for f in os.listdir(image_dir)
+                           if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")))
+            random.Random(args.seed).shuffle(files)
+            if args.limit:
+                files = files[:args.limit]
+        heldout_refs = {label_from_filename(os.path.basename(fn)) for fn in files}
+        if args.lexicon_exclude_file_list:
+            with open(args.lexicon_exclude_file_list, encoding="utf-8-sig") as f:
+                heldout_refs |= {label_from_filename(os.path.basename(line.strip()))
+                                 for line in f if line.strip()}
+        image_dir = os.path.join(args.data, "Baybayin Word Images")
+        training_refs = {label_from_filename(fn) for fn in os.listdir(image_dir)
+                         if fn.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))
+                         and label_from_filename(fn) not in heldout_refs}
+        tr = _build(args, extra_words=training_refs)
         evaluate_word_images(tr, os.path.join(args.data, "Baybayin Word Images"),
-                             args.limit, out_json=args.out)
+                             0, seed=args.seed, out_json=args.out,
+                             include_english=args.english, file_list=files)
+    elif args.cmd == "pairs":
+        os.makedirs(os.path.dirname(args.lm_cache) or ".", exist_ok=True)
+        tr = _build(args)
+        evaluate_sentence_pairs(tr, os.path.join(args.data, "Baybayin Sentence References Image"),
+                                out_json=args.out, references_csv=args.references)
     else:
         os.makedirs(os.path.dirname(args.lm_cache) or ".", exist_ok=True)
         tr = _build(args)
-        out = tr.translate_image(args.path, mode=args.mode, single_word=args.word)
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+        out = tr.translate_image(args.path, mode=args.mode, single_word=args.word,
+                                 merge_stacked=args.merge_stacked)
+        if args.out:
+            os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2, ensure_ascii=False)
+        if args.pretty:
+            print_translation_report(out)
+        else:
+            print(json.dumps(out, indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

@@ -46,27 +46,45 @@ from typing import List, Tuple
 import numpy as np
 from sklearn.metrics import (accuracy_score, classification_report,
                              confusion_matrix, f1_score)
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 
 
 # --------------------------------------------------------------------------- #
 # Data
 # --------------------------------------------------------------------------- #
 def load_split(npz_path: str, seed: int, val_frac: float = 0.15, test_frac: float = 0.15):
-    """Stratified train/val/test split (70/15/15 by default)."""
+    """Group-disjoint stratified split when source groups are saved in the NPZ.
+
+    Five-fold grouped splits approximate 64/16/20 train/validation/test. Legacy
+    NPZs without groups retain the row-stratified 70/15/15 behavior.
+    """
     d = np.load(npz_path, allow_pickle=False)
     X = d["X"].astype(np.uint8)
     y_names = d["y"].astype(str)
+    groups = d["groups"].astype(str) if "groups" in d.files else None
     classes = sorted(set(y_names.tolist()))
     cls_to_idx = {c: i for i, c in enumerate(classes)}
     y = np.array([cls_to_idx[c] for c in y_names], dtype=np.int64)
 
     idx = np.arange(len(y))
-    idx_trval, idx_test = train_test_split(idx, test_size=test_frac, stratify=y,
-                                           random_state=seed)
-    rel_val = val_frac / (1.0 - test_frac)
-    idx_train, idx_val = train_test_split(idx_trval, test_size=rel_val,
-                                          stratify=y[idx_trval], random_state=seed)
+    if groups is not None and len(np.unique(groups)) >= 5:
+        # Pick deterministic held-out folds. The slight size difference from
+        # 70/15/15 is intentional: every source group must stay intact.
+        outer = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed)
+        idx_trval, idx_test = next(outer.split(idx, y, groups))
+        inner = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=seed + 1)
+        tr_rel, val_rel = next(inner.split(idx_trval, y[idx_trval], groups[idx_trval]))
+        idx_train, idx_val = idx_trval[tr_rel], idx_trval[val_rel]
+        if (set(groups[idx_train]) & set(groups[idx_val]) or
+                set(groups[idx_train]) & set(groups[idx_test]) or
+                set(groups[idx_val]) & set(groups[idx_test])):
+            raise RuntimeError("source group leakage across classifier splits")
+    else:
+        idx_trval, idx_test = train_test_split(idx, test_size=test_frac, stratify=y,
+                                               random_state=seed)
+        rel_val = val_frac / (1.0 - test_frac)
+        idx_train, idx_val = train_test_split(idx_trval, test_size=rel_val,
+                                              stratify=y[idx_trval], random_state=seed)
     return X, y, classes, idx_train, idx_val, idx_test
 
 
@@ -147,6 +165,7 @@ def train_svm(X, y, classes, idx_train, idx_val, idx_test, out_dir, seed, max_tr
 
     pred = model.predict(flat(idx_test))
     res = summarize(y[idx_test], pred, classes)
+    res["test_samples"] = int(len(idx_test))
     res["best_params"] = {"C": best_cfg[0], "gamma": str(best_cfg[1])}
     res["train_images_used"] = int(len(fit_ix))
     joblib.dump({"model": model, "classes": classes}, os.path.join(out_dir, "svm.joblib"))
@@ -332,9 +351,12 @@ def main() -> None:
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
+    has_groups = "groups" in np.load(args.npz, allow_pickle=False).files
     X, y, classes, i_tr, i_va, i_te = load_split(args.npz, args.seed)
     print(f"{len(y)} images, {len(classes)} classes; "
           f"train/val/test = {len(i_tr)}/{len(i_va)}/{len(i_te)}")
+    print("  source-group-disjoint split" if has_groups else
+          "  WARNING: legacy NPZ has no source groups; using row-stratified split")
     with open(os.path.join(args.out, "classes.json"), "w") as f:
         json.dump(classes, f, indent=2)
     np.savez(os.path.join(args.out, "split.npz"), train=i_tr, val=i_va, test=i_te)

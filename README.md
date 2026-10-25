@@ -219,4 +219,121 @@ The resulting artifacts can be used for:
 - Kudlit and Virama mark analysis.
 - OCR inference and downstream transliteration.
 
+## 7. Train, run, and evaluate the OCR model
+
+Install the dependencies used by preprocessing, training, and evaluation:
+
+```powershell
+python -m pip install numpy opencv-python pandas scikit-learn matplotlib torch
+```
+
+From the project root, preprocess the images and train the character classifier:
+
+```powershell
+python baybayin_preprocess.py dataset dataset --out out/
+python train_models.py --npz out/symbols/symbols_dataset.npz --out models/ --seed 42 --epochs 5 --patience 3 --skip-svm
+```
+
+The training options above reproduce the five-epoch CNN verification run. For a longer
+training run using the defaults (up to 40 CNN epochs plus the SVM baseline), omit
+`--epochs 5 --patience 3 --skip-svm`.
+
+To reproduce the separate SVM baseline used in the findings tables, train it into its
+own output folder so the CNN metrics remain intact:
+
+```powershell
+python train_models.py --npz out/symbols/symbols_dataset.npz --out models_svm/ --seed 42 --skip-cnn --svm-max-train 2500
+```
+
+Training saves the CNN weights, a stratified and source-group-disjoint train/validation/test
+split, class metrics, and confusion matrices in `models/`. Source groups come from the
+symbol filenames, preventing crops from one source image/page from appearing on both
+sides of the evaluation. The split is approximately 64/16/20 because groups stay intact.
+The reported character accuracy and macro-F1 are measured on the held-out test split.
+They measure isolated glyph classification, not word segmentation or translation accuracy.
+
+Run deterministic checks of transliteration candidate generation and the language
+model using ideal (perfect) glyph observations:
+
+```powershell
+python translate_pipeline.py selftest --data dataset --n 2000 --seed 0
+```
+
+This oracle check isolates candidate search and ranking. It does not measure the CNN or
+image segmentation, and its generated spellings are only approximations of traditional
+Baybayin conventions. The pipeline defaults to `--beta 0.25` for the language-model
+weight; pass `--beta 1` to compare with the older stronger language-model weighting.
+
+Evaluate end-to-end word-image recognition on the labeled filenames in
+`dataset/Baybayin Word Images/`:
+
+```powershell
+python translate_pipeline.py words --data dataset --cnn models/cnn.pt --no-nllb --out models/word_eval.json
+```
+
+The report gives top-1 exact match,
+top-5 identification, character error rate (CER), and failed-image count. This is the
+full-dataset diagnostic on isolated word images; it is not an independent accuracy
+estimate because filename-derived labels can be included in candidate generation. It
+does not measure full-sentence or English translation quality. The current run covers
+1,001 images and reports 67.33% top-1, 72.23% top-5, and mean CER 0.1521. Use a separate,
+reference-grouped holdout with held-out labels excluded from the lexicon for a fair
+generalization estimate. `top1_by_beta_diagnostic` compares language-model weights on
+the same dataset and is for tuning only.
+
+To print another deterministic 50-image sample with the top Tagalog candidate and its
+dictionary English gloss on each line, use a different seed:
+
+```powershell
+python translate_pipeline.py words --data dataset --cnn models/cnn.pt --no-nllb --english --limit 50 --seed 1 --out models/word_eval_english_50.json
+```
+
+The English gloss may contain multiple dictionary senses or `[word]` when no gloss is
+available. This output is for review; it is not an English-translation accuracy score.
+
+The main model used by the run commands is `models/cnn.pt`. Experimental adaptation
+checkpoints and scratch evaluation outputs are not part of the main model workflow.
+
+The English dictionary retains distinct senses for words with multiple parts of speech.
+For example, `laban` now returns `fight, match, contest; against, versus` instead of
+discarding the noun sense. An isolated word has no sentence context to choose a single
+meaning.
+
+Translate one word image or sentence photo:
+
+```powershell
+python translate_pipeline.py image "dataset/Baybayin Word Images/1 Gwapo.PNG" --data dataset --cnn models/cnn.pt --word --no-nllb
+python translate_pipeline.py image path\to\sentence.jpg --data dataset --cnn models/cnn.pt --mode photo
+```
+
+For a compact terminal view, add `--pretty` to `image`. To run every numbered
+Baybayin/Tagalog guide pair (for example, `2.jpg` with `2.1.jpg`) and print the
+approximate Baybayin reading, model Tagalog output, and English output together:
+
+```powershell
+python translate_pipeline.py pairs --data dataset --cnn models/cnn.pt --no-nllb --out models/sentence_pair_results.json
+```
+
+The paired files are image guides, so they are not automatically scored as text. Fill
+`sentence_pair_references.csv` with checked transcriptions in its `tagalog_reference`
+column and human English translations in `english_reference`; then pass
+`--references sentence_pair_references.csv` to `pairs` to print Tagalog and English CER/WER.
+Keep `image` values as the Baybayin-side filenames (`2.jpg`, `8.jpg`).
+
+Print the saved CNN, SVM, word-image, oracle, sample translation, and error tables in
+the terminal (and save a Markdown copy) with:
+
+```powershell
+python report_findings.py --cnn-dir models --svm-dir models_svm --word-eval models/word_eval.json --selftest models/selftest.json --sample models/sample_word.json --out models/findings.md
+```
+
+The report is only as current as those saved evaluation files. Re-run the matching
+training/evaluation command after changing the model or dataset.
+
+For fair accuracy comparisons, keep the model, seed, preprocessing settings, and
+evaluation image set fixed. The word-image filenames serve as references, so check that
+each filename matches the Baybayin content before treating the aggregate score as
+ground truth. NLLB sentence output is a separate, generative translation stage; evaluate
+it against human-reviewed English references rather than the OCR word metrics.
+
 ---

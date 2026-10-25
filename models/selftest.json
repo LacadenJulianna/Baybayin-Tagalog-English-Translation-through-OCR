@@ -1,0 +1,86 @@
+{
+  "words_tested": 2000,
+  "candidate_recall": 0.95,
+  "top1": 0.615,
+  "top5": 0.8735,
+  "mean_candidates": 18.3385,
+  "median_candidates": 10.0,
+  "top1_by_beta_diagnostic": {
+    "0.0": 0.621,
+    "0.1": 0.622,
+    "0.25": 0.619,
+    "0.5": 0.5865,
+    "1.0": 0.5085
+  },
+  "seconds": 9.1,
+  "lexicon_words": 41350,
+  "prefixes": 125710,
+  "lm_tokens": 6193195,
+  "bigrams": 180571,
+  "sample_misses": [
+    {
+      "reference": "maibhan",
+      "predicted": [
+        "madeha",
+        "mamihag",
+        "mabihag"
+      ]
+    },
+    {
+      "reference": "pagligaw",
+      "predicted": [
+        "palinga",
+        "paligaw",
+        "pagligaw"
+      ]
+    },
+    {
+      "reference": "humalaw",
+      "predicted": [
+        "humalay",
+        "humalaw",
+        "humadlang"
+      ]
+    },
+    {
+      "reference": "maymgamali",
+      "predicted": [
+        "magmaliw",
+        "magmuli",
+        "magmalas"
+      ]
+    },
+    {
+      "reference": "haklit",
+      "predicted": [
+        "hali",
+        "hale",
+        "halik"
+      ]
+    },
+    {
+      "reference": "klub",
+      "predicted": [
+        "lol",
+        "luh",
+        "la"
+      ]
+    },
+    {
+      "reference": "sigit",
+      "predicted": [
+        "sige",
+        "sigi",
+        "sigid"
+      ]
+    },
+    {
+      "reference": "sandal",
+      "predicted": [
+        "sara",
+        "sarap",
+        "saray"
+      ]
+    }
+  ]
+}
