@@ -4,8 +4,8 @@
 
 | Evaluation metric | CNN | SVM |
 | --- | --- | --- |
-| Classification accuracy | 98.66% | 88.02% |
-| Macro-averaged F1-score | 0.9860 | 0.8726 |
+| Classification accuracy | 99.50% | 88.02% |
+| Macro-averaged F1-score | 0.9945 | 0.8726 |
 | Number of evaluation samples | 7176 | 7176 |
 
 CNN training used 23026 glyphs; SVM training used 2500 glyphs. Both used the same source-group-disjoint test split.
@@ -16,9 +16,9 @@ CNN training used 23026 glyphs; SVM training used 2500 glyphs. Both used the sam
 | --- | --- |
 | Number of images tested | 1001 |
 | Failed images | 0 |
-| Top-1 exact-match accuracy | 67.33% |
-| Top-5 word identification accuracy | 72.23% |
-| Mean CER against filename references | 0.1521 |
+| Top-1 exact-match accuracy | 66.63% |
+| Top-5 word identification accuracy | 71.13% |
+| Mean CER against filename references | 0.1717 |
 
 **Table 3. Sample Baybayin Word Recognition and English Translation**
 

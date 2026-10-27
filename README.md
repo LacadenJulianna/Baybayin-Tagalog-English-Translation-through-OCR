@@ -231,12 +231,13 @@ From the project root, preprocess the images and train the character classifier:
 
 ```powershell
 python baybayin_preprocess.py dataset dataset --out out/
-python train_models.py --npz out/symbols/symbols_dataset.npz --out models/ --seed 42 --epochs 5 --patience 3 --skip-svm
+python train_models.py --npz out/symbols/symbols_dataset.npz --out models/ --seed 42 --skip-svm
 ```
 
-The training options above reproduce the five-epoch CNN verification run. For a longer
-training run using the defaults (up to 40 CNN epochs plus the SVM baseline), omit
-`--epochs 5 --patience 3 --skip-svm`.
+This reproduces the saved CNN: up to 40 epochs with early stopping after 6 epochs
+without validation improvement (the saved run stopped at epoch 29, best at epoch 23).
+For a quick five-epoch check, add `--epochs 5 --patience 3`. Omit `--skip-svm` to also
+train the SVM baseline in the same folder.
 
 To reproduce the separate SVM baseline used in the findings tables, train it into its
 own output folder so the CNN metrics remain intact:
@@ -273,10 +274,12 @@ python translate_pipeline.py words --data dataset --cnn models/cnn.pt --no-nllb 
 
 The report gives top-1 exact match,
 top-5 identification, character error rate (CER), and failed-image count. This is the
-full-dataset diagnostic on isolated word images; it is not an independent accuracy
-estimate because filename-derived labels can be included in candidate generation. It
-does not measure full-sentence or English translation quality. The current run covers
-1,001 images and reports 67.33% top-1, 72.23% top-5, and mean CER 0.1521. Use a separate,
+full-dataset diagnostic on isolated word images. Labels of the evaluated images are
+excluded from the filename-derived lexicon words, but they may still appear in the
+Tagalog dictionary files, and the language-model weight was tuned on this same set, so
+it is not a fully independent accuracy estimate. It does not measure full-sentence or
+English translation quality. The current run covers 1,001 images and reports 66.63%
+top-1, 71.13% top-5, and mean CER 0.1717. Use a separate,
 reference-grouped holdout with held-out labels excluded from the lexicon for a fair
 generalization estimate. `top1_by_beta_diagnostic` compares language-model weights on
 the same dataset and is for tuning only.
